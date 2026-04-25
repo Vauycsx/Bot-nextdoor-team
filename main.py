@@ -9,14 +9,14 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery
+    CallbackQuery,
+    FSInputFile
 )
 
-# ===== SIMPLE HTTP SERVER (NO FASTAPI) =====
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 
-# ===== ENV (Render) =====
+# ===== ENV =====
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7062911219"))
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -26,11 +26,7 @@ bot = Bot(TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# ===== STATE =====
-admin_mode = {}
-pool: asyncpg.Pool = None
-
-# ===== SIMPLE WEB SERVER (for Render port) =====
+# ===== WEB SERVER =====
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -38,11 +34,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b'{"status":"bot running"}')
 
-
 def run_web():
     server = HTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"Web server running on port {PORT}")
     server.serve_forever()
+
+# ===== STATE =====
+admin_mode = {}
+pool: asyncpg.Pool = None
 
 # ===== DB =====
 async def init_db():
@@ -66,7 +64,8 @@ async def init_db():
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS cards (
             id SERIAL PRIMARY KEY,
-            value TEXT
+            value TEXT,
+            category TEXT
         );
         """)
 
@@ -86,11 +85,20 @@ def get_menu(uid):
         [KeyboardButton(text="🔑 Доступы"), KeyboardButton(text="📚 Мануалы")],
         [KeyboardButton(text="💳 Карты")]
     ]
-
     if uid == ADMIN_ID:
         base.append([KeyboardButton(text="🛠 Админ")])
-
     return ReplyKeyboardMarkup(keyboard=base, resize_keyboard=True)
+
+admin_menu = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="➕ Код", callback_data="code")],
+    [InlineKeyboardButton(text="➕ Почта", callback_data="email")],
+    [InlineKeyboardButton(text="➕ Домен", callback_data="domain")],
+    [InlineKeyboardButton(text="➕ Доступ", callback_data="access")],
+    [InlineKeyboardButton(text="➕ Мануал", callback_data="manual")],
+    [InlineKeyboardButton(text="💳 Карты 1", callback_data="cards_1")],
+    [InlineKeyboardButton(text="💳 Карты 2", callback_data="cards_2")],
+    [InlineKeyboardButton(text="📤 Логи", callback_data="logs")]
+])
 
 cards_kb = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="Первая карта", callback_data="card_1")],
@@ -105,21 +113,18 @@ async def get_user(uid):
 
 async def set_user(uid, role="user"):
     async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO users(id, role) VALUES($1,$2) ON CONFLICT (id) DO NOTHING",
-            uid, role
-        )
+        await conn.execute("INSERT INTO users(id, role) VALUES($1,$2) ON CONFLICT (id) DO NOTHING", uid, role)
 
-async def get_card(uid, second=False):
+async def get_card(uid, category, second=False):
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT last_used FROM card_usage WHERE user_id=$1", uid)
         now = datetime.utcnow()
 
         if row and row["last_used"]:
-            if now - row["last_used"] < timedelta(minutes=random.randint(10, 30)) and not second:
+            if now - row["last_used"] < timedelta(minutes=random.randint(10,30)) and not second:
                 return None, "⏳ подожди"
 
-        cards = await conn.fetch("SELECT value FROM cards")
+        cards = await conn.fetch("SELECT value FROM cards WHERE category=$1", category)
         if not cards:
             return None, "нет карт"
 
@@ -134,7 +139,7 @@ async def get_card(uid, second=False):
 
         return card, None
 
-# ===== BOT =====
+# ===== HANDLER =====
 
 @router.message()
 async def handler(msg: Message):
@@ -143,6 +148,17 @@ async def handler(msg: Message):
 
     user = await get_user(uid)
 
+    if uid == ADMIN_ID and uid in admin_mode:
+        mode = admin_mode[uid]
+        items = [x.strip() for x in text.split() if x.strip()]
+
+        async with pool.acquire() as conn:
+            for item in items:
+                await conn.execute("INSERT INTO cards(value, category) VALUES($1,$2)", item, mode)
+
+        del admin_mode[uid]
+        return await msg.answer(f"✅ добавлено карт: {len(items)}")
+
     if text == "/start":
         if not user and uid != ADMIN_ID:
             return await msg.answer("🔐 код")
@@ -150,7 +166,10 @@ async def handler(msg: Message):
         return await msg.answer("welcome", reply_markup=get_menu(uid))
 
     if text == "💳 Карты":
-        return await msg.answer("Выбери карту", reply_markup=cards_kb)
+        return await msg.answer("выбери", reply_markup=cards_kb)
+
+    if text == "🛠 Админ" and uid == ADMIN_ID:
+        return await msg.answer("admin", reply_markup=admin_menu)
 
 # ===== CALLBACK =====
 
@@ -159,27 +178,42 @@ async def cb(c: CallbackQuery):
     await c.answer()
     uid = c.from_user.id
 
+    if uid != ADMIN_ID:
+        return
+
     if c.data == "card_1":
-        card, err = await get_card(uid)
+        card, err = await get_card(uid, "1")
         return await c.message.answer(err or f"🎴 {card}")
 
     if c.data == "card_2":
-        card, err = await get_card(uid, second=True)
+        card, err = await get_card(uid, "2", second=True)
         return await c.message.answer(err or f"🎴 {card}")
 
-# ===== RUN BOT =====
+    if c.data in ["cards_1", "cards_2"]:
+        admin_mode[uid] = "1" if c.data == "cards_1" else "2"
+        return await c.message.answer("отправь карты (через пробел или перенос строки)")
+
+    if c.data in ["code","email","domain","access","manual"]:
+        admin_mode[uid] = c.data + "s"
+        return await c.message.answer("введи значение")
+
+    if c.data == "logs":
+        try:
+            return await c.message.answer_document(FSInputFile("logs.txt"))
+        except:
+            return await c.message.answer("логов нет")
+
+# ===== RUN =====
 
 async def run_bot():
     await init_db()
     dp.include_router(router)
-    print("BOT RUNNING")
     await dp.start_polling(bot)
 
-# ===== MAIN =====
 
-async def main():
+def main():
     threading.Thread(target=run_web).start()
-    await run_bot()
+    asyncio.run(run_bot())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
