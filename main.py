@@ -12,8 +12,8 @@ from aiogram.types import (
     CallbackQuery
 )
 
-from fastapi import FastAPI
-import uvicorn
+# ===== SIMPLE HTTP SERVER (NO FASTAPI) =====
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 
 # ===== ENV (Render) =====
@@ -26,15 +26,23 @@ bot = Bot(TOKEN)
 dp = Dispatcher()
 router = Router()
 
-app = FastAPI()
-
-@app.get("/")
-def home():
-    return {"status": "bot running"}
-
 # ===== STATE =====
 admin_mode = {}
 pool: asyncpg.Pool = None
+
+# ===== SIMPLE WEB SERVER (for Render port) =====
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(b'{"status":"bot running"}')
+
+
+def run_web():
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"Web server running on port {PORT}")
+    server.serve_forever()
 
 # ===== DB =====
 async def init_db():
@@ -78,8 +86,10 @@ def get_menu(uid):
         [KeyboardButton(text="🔑 Доступы"), KeyboardButton(text="📚 Мануалы")],
         [KeyboardButton(text="💳 Карты")]
     ]
+
     if uid == ADMIN_ID:
         base.append([KeyboardButton(text="🛠 Админ")])
+
     return ReplyKeyboardMarkup(keyboard=base, resize_keyboard=True)
 
 cards_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -88,6 +98,7 @@ cards_kb = InlineKeyboardMarkup(inline_keyboard=[
 ])
 
 # ===== HELPERS =====
+
 async def get_user(uid):
     async with pool.acquire() as conn:
         return await conn.fetchrow("SELECT * FROM users WHERE id=$1", uid)
@@ -123,7 +134,7 @@ async def get_card(uid, second=False):
 
         return card, None
 
-# ===== BOT HANDLER =====
+# ===== BOT =====
 
 @router.message()
 async def handler(msg: Message):
@@ -163,11 +174,6 @@ async def run_bot():
     dp.include_router(router)
     print("BOT RUNNING")
     await dp.start_polling(bot)
-
-# ===== RUN WEB =====
-
-def run_web():
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
 
 # ===== MAIN =====
 
