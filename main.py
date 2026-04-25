@@ -77,14 +77,14 @@ def menu(uid):
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
-    [InlineKeyboardButton("🧹 Очистка карт", callback_data="clear_cards")],
-    [InlineKeyboardButton("🧹 Очистка почт", callback_data="clear_emails")],
-    [InlineKeyboardButton("🧹 Очистка доменов", callback_data="clear_domains")],
-    [InlineKeyboardButton("🧹 Очистка доступов", callback_data="clear_access")],
-    [InlineKeyboardButton("📤 Выгрузка карт", callback_data="dump_cards")],
-    [InlineKeyboardButton("➕ Карты 1", callback_data="add_1")],
-    [InlineKeyboardButton("➕ Карты 2", callback_data="add_2")]
+    [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
+    [InlineKeyboardButton(text="🧹 Очистка карт", callback_data="clear_cards")],
+    [InlineKeyboardButton(text="🧹 Очистка почт", callback_data="clear_emails")],
+    [InlineKeyboardButton(text="🧹 Очистка доменов", callback_data="clear_domains")],
+    [InlineKeyboardButton(text="🧹 Очистка доступов", callback_data="clear_access")],
+    [InlineKeyboardButton(text="📤 Выгрузка карт", callback_data="dump_cards")],
+    [InlineKeyboardButton(text="➕ Карты 1", callback_data="add_1")],
+    [InlineKeyboardButton(text="➕ Карты 2", callback_data="add_2")]
 ])
 
 cards_kb = InlineKeyboardMarkup(inline_keyboard=[
