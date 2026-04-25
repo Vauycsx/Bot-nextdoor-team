@@ -9,27 +9,36 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery,
-    FSInputFile
+    CallbackQuery
 )
 
-# ===== ENV (Render friendly) =====
+from fastapi import FastAPI
+import uvicorn
+import threading
+
+# ===== ENV (Render) =====
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7062911219"))
 DATABASE_URL = os.getenv("DATABASE_URL")
+PORT = int(os.getenv("PORT", 10000))
 
 bot = Bot(TOKEN)
 dp = Dispatcher()
 router = Router()
 
+app = FastAPI()
+
+@app.get("/")
+def home():
+    return {"status": "bot running"}
+
 # ===== STATE =====
 admin_mode = {}
 pool: asyncpg.Pool = None
 
-# ===== DB INIT =====
+# ===== DB =====
 async def init_db():
     global pool
-
     pool = await asyncpg.create_pool(DATABASE_URL)
 
     async with pool.acquire() as conn:
@@ -40,25 +49,11 @@ async def init_db():
         );
         """)
 
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS codes (code TEXT);
-        """)
-
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS emails (value TEXT);
-        """)
-
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS domains (value TEXT);
-        """)
-
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS accesses (value TEXT);
-        """)
-
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS manuals (value TEXT);
-        """)
+        await conn.execute("CREATE TABLE IF NOT EXISTS codes (code TEXT);")
+        await conn.execute("CREATE TABLE IF NOT EXISTS emails (value TEXT);")
+        await conn.execute("CREATE TABLE IF NOT EXISTS domains (value TEXT);")
+        await conn.execute("CREATE TABLE IF NOT EXISTS accesses (value TEXT);")
+        await conn.execute("CREATE TABLE IF NOT EXISTS manuals (value TEXT);")
 
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS cards (
@@ -83,10 +78,8 @@ def get_menu(uid):
         [KeyboardButton(text="🔑 Доступы"), KeyboardButton(text="📚 Мануалы")],
         [KeyboardButton(text="💳 Карты")]
     ]
-
     if uid == ADMIN_ID:
         base.append([KeyboardButton(text="🛠 Админ")])
-
     return ReplyKeyboardMarkup(keyboard=base, resize_keyboard=True)
 
 cards_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -95,7 +88,6 @@ cards_kb = InlineKeyboardMarkup(inline_keyboard=[
 ])
 
 # ===== HELPERS =====
-
 async def get_user(uid):
     async with pool.acquire() as conn:
         return await conn.fetchrow("SELECT * FROM users WHERE id=$1", uid)
@@ -110,7 +102,6 @@ async def set_user(uid, role="user"):
 async def get_card(uid, second=False):
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT last_used FROM card_usage WHERE user_id=$1", uid)
-
         now = datetime.utcnow()
 
         if row and row["last_used"]:
@@ -132,7 +123,7 @@ async def get_card(uid, second=False):
 
         return card, None
 
-# ===== HANDLER =====
+# ===== BOT HANDLER =====
 
 @router.message()
 async def handler(msg: Message):
@@ -165,18 +156,24 @@ async def cb(c: CallbackQuery):
         card, err = await get_card(uid, second=True)
         return await c.message.answer(err or f"🎴 {card}")
 
-# ===== START =====
+# ===== RUN BOT =====
 
-async def main():
-    if not TOKEN or not DATABASE_URL:
-        print("Missing env vars")
-        return
-
+async def run_bot():
     await init_db()
     dp.include_router(router)
-
-    print("BOT RUNNING (Render mode)")
+    print("BOT RUNNING")
     await dp.start_polling(bot)
+
+# ===== RUN WEB =====
+
+def run_web():
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
+
+# ===== MAIN =====
+
+async def main():
+    threading.Thread(target=run_web).start()
+    await run_bot()
 
 if __name__ == "__main__":
     asyncio.run(main())
