@@ -1,39 +1,59 @@
+import os
 import asyncio
-import sqlite3
+import asyncpg
 from datetime import datetime
 
-from aiogram import Bot, Dispatcher, Router
-from aiogram.types import (
-    Message,
-    ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    FSInputFile
-)
+from aiohttp import web
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 
-TOKEN = "ТВОЙ_ТОКЕН"
-ADMIN_ID = 7062911219
+# ================== ENV ==================
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+DATABASE_URL = os.getenv("DATABASE_URL")
+WEBHOOK_PATH = f"/webhook/{TOKEN}"
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") + WEBHOOK_PATH
 
 bot = Bot(TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# ===== DB =====
-conn = sqlite3.connect("bot.db")
-cur = conn.cursor()
+# ================== DB ==================
+pool: asyncpg.Pool = None
 
-cur.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER, role TEXT)")
-cur.execute("CREATE TABLE IF NOT EXISTS codes (code TEXT)")
-cur.execute("CREATE TABLE IF NOT EXISTS emails (value TEXT)")
-cur.execute("CREATE TABLE IF NOT EXISTS domains (value TEXT)")
-cur.execute("CREATE TABLE IF NOT EXISTS accesses (value TEXT)")
-cur.execute("CREATE TABLE IF NOT EXISTS manuals (value TEXT)")
-conn.commit()
+async def init_db():
+    global pool
+    pool = await asyncpg.create_pool(DATABASE_URL)
 
-# ===== STATE =====
-admin_mode = {}
-last_item = {}
+    async with pool.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            id BIGINT PRIMARY KEY,
+            role TEXT
+        );
 
-# ===== UI =====
+        CREATE TABLE IF NOT EXISTS codes(
+            code TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS emails(value TEXT);
+        CREATE TABLE IF NOT EXISTS domains(value TEXT);
+        CREATE TABLE IF NOT EXISTS accesses(value TEXT);
+        CREATE TABLE IF NOT EXISTS manuals(value TEXT);
+
+        CREATE TABLE IF NOT EXISTS cards(
+            id SERIAL PRIMARY KEY,
+            value TEXT,
+            category TEXT
+        );
+        """)
+
+# ================== STATE ==================
+last_item = {}         # user -> (type, value)
+last_card = {}         # user -> {category: card_id}
+
+# ================== KEYBOARDS ==================
 def get_menu(uid):
     if uid == ADMIN_ID:
         return ReplyKeyboardMarkup(
@@ -41,255 +61,418 @@ def get_menu(uid):
                 [KeyboardButton(text="👤 Профиль")],
                 [KeyboardButton(text="📧 Почта"), KeyboardButton(text="🌐 Домен")],
                 [KeyboardButton(text="🔑 Доступы"), KeyboardButton(text="📚 Мануалы")],
-                [KeyboardButton(text="📊 Дашборд")],
+                [KeyboardButton(text="💳 Карты")],
                 [KeyboardButton(text="🛠 Админ")]
             ],
             resize_keyboard=True
         )
-    else:
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="👤 Профиль")],
-                [KeyboardButton(text="📧 Почта"), KeyboardButton(text="🌐 Домен")],
-                [KeyboardButton(text="🔑 Доступы"), KeyboardButton(text="📚 Мануалы")]
-            ],
-            resize_keyboard=True
-        )
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="👤 Профиль")],
+            [KeyboardButton(text="📧 Почта"), KeyboardButton(text="🌐 Домен")],
+            [KeyboardButton(text="🔑 Доступы"), KeyboardButton(text="📚 Мануалы")],
+            [KeyboardButton(text="💳 Карты")]
+        ],
+        resize_keyboard=True
+    )
 
-admin_menu = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="➕ Код", callback_data="code")],
-    [InlineKeyboardButton(text="➕ Почта", callback_data="email")],
-    [InlineKeyboardButton(text="➕ Домен", callback_data="domain")],
-    [InlineKeyboardButton(text="➕ Доступ", callback_data="access")],
-    [InlineKeyboardButton(text="➕ Мануал", callback_data="manual")],
-    [InlineKeyboardButton(text="🗑 Доступы", callback_data="show_access")],
-    [InlineKeyboardButton(text="🗑 Мануалы", callback_data="show_manual")],
-    [InlineKeyboardButton(text="📤 Логи", callback_data="logs")]
-])
-
-rate_kb = InlineKeyboardMarkup(inline_keyboard=[
+card_kb = InlineKeyboardMarkup(inline_keyboard=[
     [
-        InlineKeyboardButton(text="✅ ОК", callback_data="ok"),
-        InlineKeyboardButton(text="❌ БАН", callback_data="ban")
+        InlineKeyboardButton(text="🟢 Обычные", callback_data="card_normal"),
+        InlineKeyboardButton(text="🟣 Генерки", callback_data="card_gen")
     ]
 ])
 
-# ===== LOG =====
-def log(uid, action, item):
+again_kb_normal = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="🔁 Ещё раз", callback_data="again_normal")]
+])
+
+again_kb_gen = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="🔁 Ещё раз", callback_data="again_gen")]
+])
+
+# ================== HELPERS ==================
+async def get_user(uid):
+    async with pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM users WHERE id=$1", uid)
+
+async def log(uid, action, item):
     with open("logs.txt", "a", encoding="utf-8") as f:
         f.write(f"{datetime.now()} | {uid} | {action} | {item}\n")
 
-# ===== HELP =====
-def get_user(uid):
-    cur.execute("SELECT * FROM users WHERE id=?", (uid,))
-    return cur.fetchone()
+# ================== AUTH ==================
+@router.message(F.text == "/start")
+async def start(msg: Message):
+    user = await get_user(msg.from_user.id)
 
-def count_user(uid, action):
-    count = 0
-    try:
-        with open("logs.txt", "r", encoding="utf-8") as f:
-            for line in f:
-                if f"| {uid} | {action} |" in line:
-                    count += 1
-    except:
-        pass
-    return count
+    if not user and msg.from_user.id != ADMIN_ID:
+        return await msg.answer("🔐 Введи код доступа")
 
-def count_all(action):
-    count = 0
-    try:
-        with open("logs.txt", "r", encoding="utf-8") as f:
-            for line in f:
-                if f"| {action} |" in line:
-                    count += 1
-    except:
-        pass
-    return count
+    await msg.answer("🚀 CRM готова", reply_markup=get_menu(msg.from_user.id))
 
-def build_delete_kb(rows, prefix):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=row[1], callback_data=f"{prefix}_{row[0]}")]
-            for row in rows
-        ]
-    )
 
-# ===== MAIN =====
 @router.message()
-async def all(msg: Message):
-
+async def auth_and_main(msg: Message):
     uid = msg.from_user.id
     text = msg.text
-    user = get_user(uid)
 
-    # ===== ADMIN INPUT =====
-    if uid == ADMIN_ID and uid in admin_mode:
-        mode = admin_mode[uid]
+    user = await get_user(uid)
 
-        table = {
-            "code": "codes",
-            "email": "emails",
-            "domain": "domains",
-            "access": "accesses",
-            "manual": "manuals"
-        }[mode]
-
-        cur.execute(f"INSERT INTO {table} VALUES (?)", (text,))
-        conn.commit()
-
-        del admin_mode[uid]
-        return await msg.answer("✅ добавлено")
-
-    # ===== START =====
-    if text == "/start":
-        if not user and uid != ADMIN_ID:
-            return await msg.answer("🔐 Введи код доступа")
-        return await msg.answer("🚀 CRM готова", reply_markup=get_menu(uid))
-
-    # ===== AUTH =====
+    # ===== AUTH CODE =====
     if not user and uid != ADMIN_ID:
-        cur.execute("SELECT * FROM codes WHERE code=?", (text,))
-        if not cur.fetchone():
-            return await msg.answer("❌ Неверный код")
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM codes WHERE code=$1", text)
 
-        cur.execute("DELETE FROM codes WHERE code=?", (text,))
-        cur.execute("INSERT INTO users VALUES (?,?)", (uid, "user"))
-        conn.commit()
+            if not row:
+                return await msg.answer("❌ Неверный код")
+
+            await conn.execute("DELETE FROM codes WHERE code=$1", text)
+            await conn.execute("INSERT INTO users VALUES ($1,$2)", uid, "user")
 
         return await msg.answer("✅ Доступ открыт", reply_markup=get_menu(uid))
 
     # ===== PROFILE =====
     if text == "👤 Профиль":
-        role = "admin" if uid == ADMIN_ID else user[1]
+        role = "admin" if uid == ADMIN_ID else user["role"]
 
         return await msg.answer(
-            f"👤 ID: {uid}\n"
-            f"🎭 Роль: {role}\n"
-            f"📧 почт: {count_user(uid, 'take_email')}\n"
-            f"🌐 доменов: {count_user(uid, 'take_domain')}\n"
-            f"✅ OK: {count_user(uid, 'ok')}\n"
-            f"❌ BAN: {count_user(uid, 'ban')}"
+            f"👤 ID: {uid}\n🎭 Роль: {role}"
         )
+
+    # ===== CARDS MENU =====
+    if text == "💳 Карты":
+        return await msg.answer("Выбери категорию:", reply_markup=card_kb)
+
+
+# ================== CARDS ==================
+async def get_random_card(category: str, exclude_id=None):
+    async with pool.acquire() as conn:
+        if exclude_id:
+            row = await conn.fetchrow("""
+                SELECT * FROM cards
+                WHERE category=$1 AND id != $2
+                ORDER BY RANDOM()
+                LIMIT 1
+            """, category, exclude_id)
+        else:
+            row = await conn.fetchrow("""
+                SELECT * FROM cards
+                WHERE category=$1
+                ORDER BY RANDOM()
+                LIMIT 1
+            """, category)
+
+        return row
+
+
+async def send_card(msg_or_cb, uid, category):
+    row = await get_random_card(category)
+
+    if not row:
+        return await msg_or_cb.message.answer("❌ Нет карт")
+
+    last_card.setdefault(uid, {})[category] = row["id"]
+
+    kb = again_kb_normal if category == "normal" else again_kb_gen
+
+    await msg_or_cb.message.answer(f"💳 Карта:\n{row['value']}", reply_markup=kb)
+
+
+# ================== CALLBACKS ==================
+@router.callback_query()
+async def callbacks(cb: CallbackQuery):
+    await cb.answer()
+    uid = cb.from_user.id
+
+    # ===== CARDS FIRST TIME =====
+    if cb.data == "card_normal":
+        return await send_card(cb, uid, "normal")
+
+    if cb.data == "card_gen":
+        return await send_card(cb, uid, "gen")
+
+    # ===== AGAIN NORMAL =====
+    if cb.data == "again_normal":
+        prev = last_card.get(uid, {}).get("normal")
+        row = await get_random_card("normal", exclude_id=prev)
+
+        if not row:
+            return await cb.message.answer("❌ Нет карт")
+
+        last_card[uid]["normal"] = row["id"]
+        return await cb.message.answer(f"💳 Карта:\n{row['value']}", reply_markup=again_kb_normal)
+
+    # ===== AGAIN GEN =====
+    if cb.data == "again_gen":
+        prev = last_card.get(uid, {}).get("gen")
+        row = await get_random_card("gen", exclude_id=prev)
+
+        if not row:
+            return await cb.message.answer("❌ Нет карт")
+
+        last_card[uid]["gen"] = row["id"]
+        return await cb.message.answer(f"💳 Карта:\n{row['value']}", reply_markup=again_kb_gen)
+
+
+# ================== APP ==================
+async def on_startup(app):
+    await init_db()
+    await bot.set_webhook(WEBHOOK_URL)
+    print("BOT STARTED (Render webhook mode)")
+
+
+async def on_shutdown(app):
+    await bot.delete_webhook()
+    await pool.close()
+
+
+app = web.Application()
+app.on_startup.append(on_startup)
+app.on_shutdown.append(on_shutdown)
+
+dp.include_router(router)
+# ================== ADMIN STATE ==================
+admin_mode = {}
+
+# ================== HELPERS (ADMIN ADD) ==================
+TABLE_MAP = {
+    "code": "codes",
+    "email": "emails",
+    "domain": "domains",
+    "access": "accesses",
+    "manual": "manuals"
+}
+
+# ================== PROFILE COUNT ==================
+async def count_user(uid, action):
+    try:
+        with open("logs.txt", "r", encoding="utf-8") as f:
+            return sum(1 for line in f if f"| {uid} | {action} |" in line)
+    except:
+        return 0
+
+
+async def count_all(action):
+    try:
+        with open("logs.txt", "r", encoding="utf-8") as f:
+            return sum(1 for line in f if f"| {action} |" in line)
+    except:
+        return 0
+
+
+# ================== EMAIL / DOMAIN / ETC ==================
+async def take_one(table):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(f"SELECT id, value FROM {table} ORDER BY RANDOM() LIMIT 1")
+        if not row:
+            return None
+
+        await conn.execute(f"DELETE FROM {table} WHERE id=$1", row["id"])
+        return row["value"]
+
+
+# ================== MAIN HANDLER EXTENSION ==================
+@router.message()
+async def main_extended(msg: Message):
+    uid = msg.from_user.id
+    text = msg.text
+
+    user = await get_user(uid)
+
+    # ===== ADMIN INPUT MODE =====
+    if uid == ADMIN_ID and uid in admin_mode:
+        mode = admin_mode[uid]
+
+        table = TABLE_MAP[mode]
+
+        async with pool.acquire() as conn:
+            await conn.execute(f"INSERT INTO {table}(value) VALUES ($1)", text)
+
+        del admin_mode[uid]
+        return await msg.answer("✅ добавлено")
+
 
     # ===== EMAIL =====
     if text == "📧 Почта":
-        cur.execute("SELECT rowid, value FROM emails LIMIT 1")
-        row = cur.fetchone()
+        value = await take_one("emails")
 
-        if not row:
+        if not value:
             return await msg.answer("❌ нет почт")
 
-        cur.execute("DELETE FROM emails WHERE rowid=?", (row[0],))
-        conn.commit()
+        last_item[uid] = ("email", value)
+        await log(uid, "take_email", value)
 
-        last_item[uid] = ("email", row[1])
-        log(uid, "take_email", row[1])
+        return await msg.answer(value, reply_markup=rate_kb)
 
-        return await msg.answer(row[1], reply_markup=rate_kb)
 
     # ===== DOMAIN =====
     if text == "🌐 Домен":
-        cur.execute("SELECT rowid, value FROM domains LIMIT 1")
-        row = cur.fetchone()
+        value = await take_one("domains")
 
-        if not row:
+        if not value:
             return await msg.answer("❌ нет доменов")
 
-        cur.execute("DELETE FROM domains WHERE rowid=?", (row[0],))
-        conn.commit()
+        last_item[uid] = ("domain", value)
+        await log(uid, "take_domain", value)
 
-        last_item[uid] = ("domain", row[1])
-        log(uid, "take_domain", row[1])
+        return await msg.answer(value, reply_markup=rate_kb)
 
-        return await msg.answer(row[1], reply_markup=rate_kb)
 
     # ===== ACCESS =====
     if text == "🔑 Доступы":
-        cur.execute("SELECT value FROM accesses")
-        rows = cur.fetchall()
-        return await msg.answer("\n".join([r[0] for r in rows]) or "нет")
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT value FROM accesses")
+
+        data = "\n".join([r["value"] for r in rows]) if rows else "нет"
+        return await msg.answer(data)
+
 
     # ===== MANUALS =====
     if text == "📚 Мануалы":
-        cur.execute("SELECT value FROM manuals")
-        rows = cur.fetchall()
-        return await msg.answer("\n".join([r[0] for r in rows]) or "нет")
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT value FROM manuals")
+
+        data = "\n".join([r["value"] for r in rows]) if rows else "нет"
+        return await msg.answer(data)
+
 
     # ===== DASHBOARD =====
     if text == "📊 Дашборд" and uid == ADMIN_ID:
         return await msg.answer(
             f"📊 Статистика:\n"
-            f"📧 почты: {count_all('take_email')}\n"
-            f"🌐 домены: {count_all('take_domain')}\n"
-            f"✅ OK: {count_all('ok')}\n"
-            f"❌ BAN: {count_all('ban')}"
+            f"📧 почты: {await count_all('take_email')}\n"
+            f"🌐 домены: {await count_all('take_domain')}\n"
+            f"✅ OK: {await count_all('ok')}\n"
+            f"❌ BAN: {await count_all('ban')}"
         )
 
-    # ===== ADMIN =====
-    if text == "🛠 Админ" and uid == ADMIN_ID:
-        return await msg.answer("⚙️ Панель", reply_markup=admin_menu)
 
-# ===== CALLBACK =====
+    # ===== ADMIN PANEL =====
+    if text == "🛠 Админ" and uid == ADMIN_ID:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Код", callback_data="code")],
+            [InlineKeyboardButton(text="➕ Почта", callback_data="email")],
+            [InlineKeyboardButton(text="➕ Домен", callback_data="domain")],
+            [InlineKeyboardButton(text="➕ Доступ", callback_data="access")],
+            [InlineKeyboardButton(text="➕ Мануал", callback_data="manual")],
+            [InlineKeyboardButton(text="🗑 Доступы", callback_data="show_access")],
+            [InlineKeyboardButton(text="🗑 Мануалы", callback_data="show_manual")],
+            [InlineKeyboardButton(text="📤 Логи", callback_data="logs")]
+        ])
+
+        return await msg.answer("⚙️ Админ панель", reply_markup=kb)
+
+
+# ================== CALLBACKS EXTENDED ==================
 @router.callback_query()
-async def cb(c):
-    await c.answer()
-    uid = c.from_user.id
+async def cb_extended(cb: CallbackQuery):
+    await cb.answer()
+    uid = cb.from_user.id
 
     # ===== OK / BAN =====
-    if c.data in ["ok", "ban"]:
+    if cb.data in ["ok", "ban"]:
         if uid in last_item:
             item_type, value = last_item[uid]
-            log(uid, c.data, value)
+            await log(uid, cb.data, value)
             del last_item[uid]
-            return await c.message.answer(f"{c.data.upper()} сохранено")
+            return await cb.message.answer(f"{cb.data.upper()} сохранено")
 
+
+    # ===== ADMIN ONLY =====
     if uid != ADMIN_ID:
         return
 
+
+    # ===== ADD MODE =====
+    if cb.data in ["code", "email", "domain", "access", "manual"]:
+        admin_mode[uid] = cb.data
+        return await cb.message.answer(f"✍️ Введи {cb.data}")
+
+
     # ===== LOGS =====
-    if c.data == "logs":
+    if cb.data == "logs":
         try:
-            await c.message.answer_document(FSInputFile("logs.txt"))
+            await cb.message.answer_document(FSInputFile("logs.txt"))
         except:
-            await c.message.answer("нет логов")
+            await cb.message.answer("нет логов")
         return
 
-    # ===== SHOW DELETE =====
-    if c.data == "show_access":
-        cur.execute("SELECT rowid, value FROM accesses")
-        rows = cur.fetchall()
+
+    # ===== SHOW DELETE ACCESS =====
+    if cb.data == "show_access":
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT id, value FROM accesses")
+
         if not rows:
-            return await c.message.answer("нет доступов")
-        return await c.message.answer("выбери:", reply_markup=build_delete_kb(rows, "del_access"))
+            return await cb.message.answer("нет доступов")
 
-    if c.data == "show_manual":
-        cur.execute("SELECT rowid, value FROM manuals")
-        rows = cur.fetchall()
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=r["value"], callback_data=f"del_access_{r['id']}")]
+            for r in rows
+        ])
+
+        return await cb.message.answer("выбери:", reply_markup=kb)
+
+
+    # ===== SHOW DELETE MANUAL =====
+    if cb.data == "show_manual":
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT id, value FROM manuals")
+
         if not rows:
-            return await c.message.answer("нет мануалов")
-        return await c.message.answer("выбери:", reply_markup=build_delete_kb(rows, "del_manual"))
+            return await cb.message.answer("нет мануалов")
 
-    # ===== DELETE =====
-    if c.data.startswith("del_access_"):
-        rid = c.data.split("_")[2]
-        cur.execute("DELETE FROM accesses WHERE rowid=?", (rid,))
-        conn.commit()
-        return await c.message.answer("✅ удалено")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=r["value"], callback_data=f"del_manual_{r['id']}")]
+            for r in rows
+        ])
 
-    if c.data.startswith("del_manual_"):
-        rid = c.data.split("_")[2]
-        cur.execute("DELETE FROM manuals WHERE rowid=?", (rid,))
-        conn.commit()
-        return await c.message.answer("✅ удалено")
+        return await cb.message.answer("выбери:", reply_markup=kb)
 
-    # ===== ADD =====
-    admin_mode[uid] = c.data
-    await c.message.answer(f"введи {c.data}")
 
-# ===== RUN =====
+    # ===== DELETE ACCESS =====
+    if cb.data.startswith("del_access_"):
+        rid = int(cb.data.split("_")[2])
+
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM accesses WHERE id=$1", rid)
+
+        return await cb.message.answer("✅ удалено")
+
+
+    # ===== DELETE MANUAL =====
+    if cb.data.startswith("del_manual_"):
+        rid = int(cb.data.split("_")[2])
+
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM manuals WHERE id=$1", rid)
+
+        return await cb.message.answer("✅ удалено")
+
+
+# ================== RUN APP ==================
 async def main():
     dp.include_router(router)
-    print("FINAL CRM READY")
-    await dp.start_polling(bot)
+
+    app = web.Application()
+    app.router.add_post(WEBHOOK_PATH, webhook)
+
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+
+    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+
 
 asyncio.run(main())
+
+# webhook handler
+async def webhook(request):
+    update = await request.json()
+    await dp.feed_update(bot, update)
+    return web.Response()
+
+app.router.add_post(WEBHOOK_PATH, webhook)
+
+
+if __name__ == "__main__":
+    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
