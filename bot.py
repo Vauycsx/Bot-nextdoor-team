@@ -290,7 +290,6 @@ async def handle_all_messages(msg: Message):
             await conn.execute("DELETE FROM emails WHERE id=$1", row['id'])
         await log(uid, "take_email", row['value'])
         # сохраним последний выданный item для кнопок ОК/БАН
-        # используем словарь last_item
         if not hasattr(handle_all_messages, "last_item"):
             handle_all_messages.last_item = {}
         handle_all_messages.last_item[uid] = ("email", row['value'])
@@ -519,25 +518,18 @@ async def on_shutdown():
     if db_pool:
         await db_pool.close()
 
-@asynccontextmanager
-async def lifespan(app: web.Application):
-    await on_startup()
-    yield
-    await on_shutdown()
-
 def main():
-    # Создаём aiohttp приложение
     app = web.Application()
-    # Обработчик вебхуков
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+
     webhook_requests_handler = SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
     )
     webhook_requests_handler.register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
-    app.cleanup_ctx.append(lifespan)
 
-    # Запуск веб-сервера
     port = int(os.environ.get("PORT", 8080))
     web.run_app(app, host="0.0.0.0", port=port)
 
