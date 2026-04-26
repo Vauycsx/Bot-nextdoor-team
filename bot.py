@@ -1,6 +1,7 @@
 import asyncio
 import psycopg2
 from datetime import datetime
+import os
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.types import (
@@ -20,13 +21,9 @@ dp = Dispatcher()
 router = Router()
 
 # ===== DB (POSTGRESQL) =====
-conn = psycopg2.connect(
-    dbname="YOUR_DB",
-    user="YOUR_USER",
-    password="YOUR_PASSWORD",
-    host="localhost",
-    port="5432"
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+conn = psycopg2.connect(DATABASE_URL)
 cur = conn.cursor()
 
 cur.execute("CREATE TABLE IF NOT EXISTS users (id BIGINT PRIMARY KEY, role TEXT)")
