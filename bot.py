@@ -10,8 +10,6 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     FSInputFile
 )
-from keep_alive import keep_alive
-keep_alive()
 
 TOKEN = "TOKEN_BOT"
 ADMIN_ID = 6752278578
