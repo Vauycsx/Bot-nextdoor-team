@@ -15,8 +15,8 @@ TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-WEBHOOK_PATH = f"/webhook/{TOKEN}"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL") + WEBHOOK_PATH
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") + "/webhook"
 
 # ================== BOT ==================
 bot = Bot(TOKEN)
@@ -211,7 +211,7 @@ async def webhook(request):
     return web.Response()
 
 app = web.Application()
-app.router.add_post(WEBHOOK_PATH, webhook)
+app.router.add_post("/webhook", webhook)
 
 app.on_startup.append(on_startup)
 app.on_shutdown.append(on_shutdown)
