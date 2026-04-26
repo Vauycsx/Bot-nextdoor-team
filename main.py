@@ -1,258 +1,266 @@
 import asyncio
-import asyncpg
-import random
 import os
-from datetime import datetime
-
-from aiogram import Bot, Dispatcher, Router
+import asyncpg
+from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
-    Message, CallbackQuery,
-    ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    Message,
+    ReplyKeyboardMarkup,
+    KeyboardButton
 )
 
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import threading
-
-# ================= CONFIG =================
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "7062911219"))
-
-DB_CONFIG = {
-    "user": os.getenv("PGUSER"),
-    "password": os.getenv("PGPASSWORD"),
-    "database": os.getenv("PGDATABASE"),
-    "host": os.getenv("PGHOST")
-}
+DB_URL = os.getenv("DATABASE_URL")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 bot = Bot(TOKEN)
 dp = Dispatcher()
-router = Router()
+
 pool = None
 
-admin_state = {}
-card_index = {}
+# ===== STATE =====
+pending_users = {}
+last_cards = {}
 
-# ================= KEEP ALIVE =================
-PORT = int(os.getenv("PORT", 10000))
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-def web():
-    HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
-
-# ================= DB =================
+# ===== DB INIT =====
 async def init_db():
     global pool
-    pool = await asyncpg.create_pool(**DB_CONFIG)
+    pool = await asyncpg.create_pool(DB_URL)
 
-    async with pool.acquire() as c:
-        await c.execute("CREATE TABLE IF NOT EXISTS users(id BIGINT PRIMARY KEY, role TEXT)")
-        await c.execute("CREATE TABLE IF NOT EXISTS codes(code TEXT)")
+    async with pool.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            id BIGINT PRIMARY KEY,
+            role TEXT DEFAULT 'user',
+            banned BOOLEAN DEFAULT FALSE
+        );
 
-        await c.execute("CREATE TABLE IF NOT EXISTS emails(value TEXT)")
-        await c.execute("CREATE TABLE IF NOT EXISTS domains(value TEXT)")
-        await c.execute("CREATE TABLE IF NOT EXISTS accesses(value TEXT)")
-        await c.execute("CREATE TABLE IF NOT EXISTS manuals(value TEXT)")
+        CREATE TABLE IF NOT EXISTS access_codes(code TEXT);
 
-        await c.execute("""
+        CREATE TABLE IF NOT EXISTS emails(value TEXT);
+        CREATE TABLE IF NOT EXISTS domains(value TEXT);
+
         CREATE TABLE IF NOT EXISTS cards(
-            id SERIAL PRIMARY KEY,
             value TEXT,
-            category TEXT
-        )
+            category TEXT,
+            used BOOLEAN DEFAULT FALSE
+        );
+
+        CREATE TABLE IF NOT EXISTS accesses(name TEXT);
+        CREATE TABLE IF NOT EXISTS manuals(name TEXT);
+
+        CREATE TABLE IF NOT EXISTS logs(
+            id SERIAL,
+            user_id BIGINT,
+            action TEXT,
+            item TEXT,
+            status TEXT,
+            time TIMESTAMP DEFAULT NOW()
+        );
         """)
 
-# ================= UI =================
-def menu(uid):
+
+# ===== KEYBOARD =====
+def get_kb(is_admin=False):
     kb = [
-        [KeyboardButton("👤 Профиль")],
-        [KeyboardButton("📧 Почта"), KeyboardButton("🌐 Домен")],
-        [KeyboardButton("🔑 Доступы"), KeyboardButton("📚 Мануалы")],
-        [KeyboardButton("💳 Карты")]
+        [KeyboardButton(text="📧 Почта"), KeyboardButton(text="🌐 Домен")],
+        [KeyboardButton(text="🃏 Карты"), KeyboardButton(text="👤 Профиль")],
+        [KeyboardButton(text="🔑 Доступы"), KeyboardButton(text="📚 Мануалы")]
     ]
-    if uid == ADMIN_ID:
-        kb.append([KeyboardButton("🛠 Админ")])
+
+    if is_admin:
+        kb.append([KeyboardButton(text="🛠 Админ")])
+
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton("➕ Почта", callback_data="email")],
-    [InlineKeyboardButton("➕ Домен", callback_data="domain")],
-    [InlineKeyboardButton("➕ Доступ", callback_data="access")],
-    [InlineKeyboardButton("➕ Мануал", callback_data="manual")],
-    [InlineKeyboardButton("➕ Карты 1", callback_data="cards1")],
-    [InlineKeyboardButton("➕ Карты 2", callback_data="cards2")],
-    [InlineKeyboardButton("📊 Статистика", callback_data="stats")]
-])
 
-cards_kb = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton("Первая карта", callback_data="card_1")],
-    [InlineKeyboardButton("Вторая карта", callback_data="card_2")]
-])
+# ===== START / AUTH =====
+@dp.message(F.text == "/start")
+async def start(msg: Message):
+    async with pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT * FROM users WHERE id=$1", msg.from_user.id)
 
-retry1 = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton("❌ не подошла", callback_data="retry_1")]
-])
+    if not user:
+        pending_users[msg.from_user.id] = True
+        return await msg.answer("🔐 Введи код доступа")
 
-retry2 = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton("❌ не подошла", callback_data="retry_2")]
-])
+    await msg.answer("Бот работает", reply_markup=get_kb(msg.from_user.id == ADMIN_ID))
 
-# ================= USERS =================
-async def get_user(uid):
-    async with pool.acquire() as c:
-        return await c.fetchrow("SELECT * FROM users WHERE id=$1", uid)
 
-async def set_user(uid, role="user"):
-    async with pool.acquire() as c:
-        await c.execute(
-            "INSERT INTO users(id,role) VALUES($1,$2) ON CONFLICT DO NOTHING",
-            uid, role
+@dp.message()
+async def handle_all(msg: Message):
+    user_id = msg.from_user.id
+
+    # ===== AUTH =====
+    if user_id in pending_users:
+        async with pool.acquire() as conn:
+            code = await conn.fetchrow("SELECT * FROM access_codes WHERE code=$1", msg.text)
+
+            if not code:
+                return await msg.answer("❌ Неверный код")
+
+            role = "admin" if user_id == ADMIN_ID else "user"
+            await conn.execute("INSERT INTO users(id, role) VALUES($1,$2)", user_id, role)
+
+        del pending_users[user_id]
+        return await msg.answer("✅ Доступ разрешен", reply_markup=get_kb(user_id == ADMIN_ID))
+
+    # ===== PROFILE =====
+    if msg.text == "👤 Профиль":
+        async with pool.acquire() as conn:
+            user = await conn.fetchrow("SELECT * FROM users WHERE id=$1", user_id)
+            logs = await conn.fetchval("SELECT COUNT(*) FROM logs WHERE user_id=$1", user_id)
+
+        return await msg.answer(
+            f"👤 ID: {user_id}\n"
+            f"Role: {user['role']}\n"
+            f"Действий: {logs}"
         )
 
-# ================= CARDS =================
-async def get_card(uid, cat):
-    async with pool.acquire() as c:
-        rows = await c.fetch("SELECT value FROM cards WHERE category=$1", cat)
+    # ===== EMAIL =====
+    if msg.text == "📧 Почта":
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM emails LIMIT 1")
+
+            if not row:
+                return await msg.answer("нет почт")
+
+            await conn.execute("DELETE FROM emails WHERE value=$1", row["value"])
+            await conn.execute(
+                "INSERT INTO logs(user_id,action,item) VALUES($1,'email',$2)",
+                user_id, row["value"]
+            )
+
+        return await msg.answer(row["value"])
+
+    # ===== DOMAIN =====
+    if msg.text == "🌐 Домен":
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM domains LIMIT 1")
+
+            if not row:
+                return await msg.answer("нет доменов")
+
+            await conn.execute("DELETE FROM domains WHERE value=$1", row["value"])
+            await conn.execute(
+                "INSERT INTO logs(user_id,action,item) VALUES($1,'domain',$2)",
+                user_id, row["value"]
+            )
+
+        return await msg.answer(row["value"])
+
+    # ===== CARDS MENU =====
+    if msg.text == "🃏 Карты":
+        kb = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="Первая"), KeyboardButton(text="Вторая")],
+                [KeyboardButton(text="⬅ Назад")]
+            ],
+            resize_keyboard=True
+        )
+        return await msg.answer("Выбери категорию", reply_markup=kb)
+
+    # ===== CARD CATEGORY =====
+    if msg.text in ["Первая", "Вторая"]:
+        category = msg.text.lower()
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT * FROM cards WHERE category=$1 LIMIT 1
+            """, category)
+
+        if not row:
+            return await msg.answer("нет карт")
+
+        last_cards[user_id] = category
+
+        kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="🔁 Ещё")]],
+            resize_keyboard=True
+        )
+
+        return await msg.answer(f"🃏 {row['value']}", reply_markup=kb)
+
+    # ===== MORE =====
+    if msg.text == "🔁 Ещё":
+        category = last_cards.get(user_id)
+
+        if not category:
+            return await msg.answer("сначала выбери категорию")
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT * FROM cards WHERE category=$1 LIMIT 1
+            """, category)
+
+        if not row:
+            return await msg.answer("нет карт")
+
+        return await msg.answer(f"🃏 {row['value']}")
+
+    # ===== ACCESSES =====
+    if msg.text == "🔑 Доступы":
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM accesses")
 
         if not rows:
-            return None, "❌ нет карт"
+            return await msg.answer("нет доступов")
 
-        key = (uid, cat)
-        i = card_index.get(key, 0)
+        return await msg.answer("\n".join([r["name"] for r in rows]))
 
-        card = rows[i % len(rows)]["value"]
-        card_index[key] = i + 1
+    # ===== MANUALS =====
+    if msg.text == "📚 Мануалы":
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM manuals")
 
-        return card, None
+        if not rows:
+            return await msg.answer("нет мануалов")
 
-# ================= MESSAGE =================
-@router.message()
-async def msg(m: Message):
-    uid = m.from_user.id
-    text = m.text
+        return await msg.answer("\n".join([r["name"] for r in rows]))
 
-    user = await get_user(uid)
-
-    # START
-    if text == "/start":
-        if not user and uid != ADMIN_ID:
-            return await m.answer("🔐 код")
-
-        await set_user(uid, "admin" if uid == ADMIN_ID else "user")
-        return await m.answer("🚀 готово", reply_markup=menu(uid))
-
-    # AUTH
-    if not user and uid != ADMIN_ID:
-        async with pool.acquire() as c:
-            code = await c.fetchrow("SELECT * FROM codes WHERE code=$1", text)
-            if not code:
-                return await m.answer("❌ неверный код")
-
-            await c.execute("DELETE FROM codes WHERE code=$1", text)
-
-        return await m.answer("✅ доступ открыт", reply_markup=menu(uid))
-
-    # CARDS
-    if text == "💳 Карты":
-        return await m.answer("выбор:", reply_markup=cards_kb)
-
-    # PROFILE (ЧИСТЫЙ)
-    if text == "👤 Профиль":
-        async with pool.acquire() as c:
-            role = await c.fetchval("SELECT role FROM users WHERE id=$1", uid)
-
-            emails = await c.fetchval("SELECT COUNT(*) FROM emails")
-            domains = await c.fetchval("SELECT COUNT(*) FROM domains")
-            cards = await c.fetchval("SELECT COUNT(*) FROM cards")
-
-        return await m.answer(
-f"""👤 Профиль
-
-🆔 ID: {uid}
-🎭 Роль: {role}
-
-📧 Почты: {emails}
-🌐 Домены: {domains}
-💳 Карты: {cards}"""
+    # ===== ADMIN PANEL =====
+    if msg.text == "🛠 Админ" and user_id == ADMIN_ID:
+        return await msg.answer(
+            "🛠 Админ панель:\n"
+            "/addcode\n/addemail\n/adddomain\n/addaccess\n/addmanual\n"
+            "/delaccess\n/delman"
         )
 
-    # EMAIL
-    if text == "📧 Почта":
-        async with pool.acquire() as c:
-            row = await c.fetchrow("SELECT value FROM emails LIMIT 1")
-            if not row:
-                return await m.answer("нет")
+    # ===== ADMIN COMMANDS =====
+    if user_id == ADMIN_ID:
 
-            await c.execute("DELETE FROM emails WHERE value=$1", row["value"])
-            return await m.answer(row["value"])
+        if msg.text.startswith("/addcode"):
+            return await msg.answer("введи код")
 
-    # DOMAIN
-    if text == "🌐 Домен":
-        async with pool.acquire() as c:
-            row = await c.fetchrow("SELECT value FROM domains LIMIT 1")
-            if not row:
-                return await m.answer("нет")
+        if msg.text.startswith("/addemail"):
+            return await msg.answer("введи email")
 
-            await c.execute("DELETE FROM domains WHERE value=$1", row["value"])
-            return await m.answer(row["value"])
+        if msg.text.startswith("/adddomain"):
+            return await msg.answer("введи домен")
 
-    # ACCESS (общий список)
-    if text == "🔑 Доступы":
-        async with pool.acquire() as c:
-            rows = await c.fetch("SELECT value FROM accesses")
+        if msg.text.startswith("/addaccess"):
+            return await msg.answer("введи доступ")
 
-        return await m.answer("\n".join(r["value"] for r in rows) or "нет")
+        if msg.text.startswith("/addmanual"):
+            return await msg.answer("введи мануал")
 
-    # MANUALS
-    if text == "📚 Мануалы":
-        async with pool.acquire() as c:
-            rows = await c.fetch("SELECT value FROM manuals")
+        if msg.text.startswith("/delaccess"):
+            return await msg.answer("напиши название доступа")
 
-        return await m.answer("\n".join(r["value"] for r in rows) or "нет")
+        if msg.text.startswith("/delman"):
+            return await msg.answer("напиши название мануала")
 
-    # ADMIN
-    if text == "🛠 Админ" and uid == ADMIN_ID:
-        return await m.answer("⚙️", reply_markup=admin_kb)
+        # универсальное добавление
+        async with pool.acquire() as conn:
 
-# ================= CALLBACK =================
-@router.callback_query()
-async def cb(c: CallbackQuery):
-    uid = c.from_user.id
-    data = c.data
-    await c.answer()
+            await conn.execute("INSERT INTO emails(value) VALUES($1)", msg.text)
+            return await msg.answer("добавлено")
 
-    if data == "card_1":
-        card, err = await get_card(uid, "1")
-        return await c.message.answer(err or card, reply_markup=retry1)
-
-    if data == "card_2":
-        card, err = await get_card(uid, "2")
-        return await c.message.answer(err or card, reply_markup=retry2)
-
-    if data == "retry_1":
-        card, err = await get_card(uid, "1")
-        return await c.message.answer(err or card, reply_markup=retry1)
-
-    if data == "retry_2":
-        card, err = await get_card(uid, "2")
-        return await c.message.answer(err or card, reply_markup=retry2)
-
-    if uid == ADMIN_ID:
-        admin_state[uid] = data
-        return await c.message.answer("отправь данные")
-
-# ================= RUN =================
+# ===== RUN =====
 async def main():
     await init_db()
-    dp.include_router(router)
-    print("BOT READY")
+    print("PRO BOT STARTED")
     await dp.start_polling(bot)
 
+
 if __name__ == "__main__":
-    threading.Thread(target=web).start()
     asyncio.run(main())
