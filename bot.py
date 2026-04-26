@@ -1,537 +1,465 @@
 import asyncio
 import os
-import tempfile
-from datetime import datetime
-from contextlib import asynccontextmanager
+import random
+from datetime import datetime, timedelta
 
 import asyncpg
-from aiohttp import web
-from aiogram import Bot, Dispatcher, Router, types
+from aiogram import Bot, Dispatcher, Router
 from aiogram.types import (
-    Message, ReplyKeyboardMarkup, KeyboardButton,
+    Message, CallbackQuery,
+    ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    FSInputFile
+    BufferedInputFile,
 )
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
-# ------------------- КОНФИГ -------------------
+# ===== CONFIG =====
 TOKEN = os.getenv("BOT_TOKEN", "ТВОЙ_ТОКЕН")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7062911219"))
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:pass@localhost/db")
+DATABASE_URL = os.getenv("DATABASE_URL", "")  # Render даёт автоматически
 
-# Webhook settings (для Render)
-WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "https://your-app.onrender.com")
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+PORT = int(os.getenv("PORT", "10000"))
+WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "")  # https://my-bot.onrender.com
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+WEBHOOK_PATH = f"/tg/{TOKEN}"
 
-# ------------------- ИНИЦИАЛИЗАЦИЯ -------------------
+CARD_COOLDOWN_MIN = int(os.getenv("CARD_COOLDOWN_MIN", "10"))
+CARD_COOLDOWN_MAX = int(os.getenv("CARD_COOLDOWN_MAX", "30"))
+
 bot = Bot(TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+dp = Dispatcher()
 router = Router()
 
-# Глобальный пул соединений с БД
-db_pool = None
+pool: asyncpg.Pool | None = None
 
-# ------------------- РАБОТА С БАЗОЙ ДАННЫХ -------------------
+# ===== STATE =====
+admin_mode = {}
+last_item = {}
+
+CARD_CATEGORIES = {
+    "regular": ("Обычные", "cards_regular"),
+    "generated": ("Генерки", "cards_generated"),
+}
+
+# ===== DB =====
 async def init_db():
-    global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    global pool
+    # Render иногда даёт URL вида postgres:// — asyncpg хочет postgresql://
+    dsn = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    # SSL для Render Postgres
+    pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=5, ssl="require")
 
-    async with db_pool.acquire() as conn:
-        # Пользователи
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id BIGINT PRIMARY KEY,
-                role TEXT
-            )
-        """)
-        # Коды доступа
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS codes (
-                code TEXT PRIMARY KEY
-            )
-        """)
-        # Почты
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS emails (
-                id SERIAL PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        # Домены
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS domains (
-                id SERIAL PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        # Доступы (логин:пароль и т.п.)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS accesses (
-                id SERIAL PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        # Мануалы (текстовые ссылки или инструкции)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS manuals (
-                id SERIAL PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        # Обычные карты
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS cards_common (
-                id SERIAL PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        # Генераторные карты
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS cards_gen (
-                id SERIAL PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        # Логи действий
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS logs (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT,
-                action TEXT,
-                item TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
+    async with pool.acquire() as c:
+        await c.execute("CREATE TABLE IF NOT EXISTS users (id BIGINT PRIMARY KEY, role TEXT)")
+        await c.execute("CREATE TABLE IF NOT EXISTS codes (id SERIAL PRIMARY KEY, code TEXT)")
+        await c.execute("CREATE TABLE IF NOT EXISTS emails (id SERIAL PRIMARY KEY, value TEXT)")
+        await c.execute("CREATE TABLE IF NOT EXISTS domains (id SERIAL PRIMARY KEY, value TEXT)")
+        await c.execute("CREATE TABLE IF NOT EXISTS accesses (id SERIAL PRIMARY KEY, value TEXT)")
+        await c.execute("CREATE TABLE IF NOT EXISTS manuals (id SERIAL PRIMARY KEY, value TEXT)")
+        await c.execute("CREATE TABLE IF NOT EXISTS cards_regular (id SERIAL PRIMARY KEY, value TEXT)")
+        await c.execute("CREATE TABLE IF NOT EXISTS cards_generated (id SERIAL PRIMARY KEY, value TEXT)")
+        await c.execute("""CREATE TABLE IF NOT EXISTS card_cooldown (
+            uid BIGINT, category TEXT, card_id INTEGER, until_ts TIMESTAMPTZ,
+            PRIMARY KEY (uid, category, card_id)
+        )""")
+        await c.execute("""CREATE TABLE IF NOT EXISTS logs (
+            id SERIAL PRIMARY KEY,
+            ts TIMESTAMPTZ DEFAULT NOW(),
+            uid BIGINT,
+            action TEXT,
+            item TEXT
+        )""")
 
-async def log(uid: int, action: str, item: str):
-    """Запись лога в БД"""
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO logs (user_id, action, item) VALUES ($1, $2, $3)",
-            uid, action, item
-        )
-
-async def get_logs_text() -> str:
-    """Выгружает все логи в текстовый формат"""
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT created_at, user_id, action, item FROM logs ORDER BY id"
-        )
-    lines = [f"{r['created_at']} | {r['user_id']} | {r['action']} | {r['item']}" for r in rows]
-    return "\n".join(lines) or "Нет логов"
-
-async def count_user(uid: int, action: str) -> int:
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT COUNT(*) as cnt FROM logs WHERE user_id=$1 AND action=$2",
-            uid, action
-        )
-        return row['cnt'] if row else 0
-
-async def count_all(action: str) -> int:
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT COUNT(*) as cnt FROM logs WHERE action=$1",
-            action
-        )
-        return row['cnt'] if row else 0
-
-async def get_random_card(category: str):
-    """Возвращает случайную карту из указанной таблицы"""
-    table = "cards_common" if category == "common" else "cards_gen"
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(f"SELECT value FROM {table} ORDER BY RANDOM() LIMIT 1")
-        return row['value'] if row else None
-
-# ------------------- UI -------------------
-def get_menu(uid: int):
+# ===== UI =====
+def get_menu(uid):
     if uid == ADMIN_ID:
         return ReplyKeyboardMarkup(
             keyboard=[
                 [KeyboardButton(text="👤 Профиль")],
                 [KeyboardButton(text="📧 Почта"), KeyboardButton(text="🌐 Домен")],
                 [KeyboardButton(text="🔑 Доступы"), KeyboardButton(text="📚 Мануалы")],
-                [KeyboardButton(text="💳 Карты")],
+                [KeyboardButton(text="🎴 Карты")],
                 [KeyboardButton(text="📊 Дашборд")],
-                [KeyboardButton(text="🛠 Админ")]
+                [KeyboardButton(text="🛠 Админ")],
             ],
-            resize_keyboard=True
+            resize_keyboard=True,
         )
-    else:
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="👤 Профиль")],
-                [KeyboardButton(text="📧 Почта"), KeyboardButton(text="🌐 Домен")],
-                [KeyboardButton(text="🔑 Доступы"), KeyboardButton(text="📚 Мануалы")],
-                [KeyboardButton(text="💳 Карты")]
-            ],
-            resize_keyboard=True
-        )
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="👤 Профиль")],
+            [KeyboardButton(text="📧 Почта"), KeyboardButton(text="🌐 Домен")],
+            [KeyboardButton(text="🔑 Доступы"), KeyboardButton(text="📚 Мануалы")],
+            [KeyboardButton(text="🎴 Карты")],
+        ],
+        resize_keyboard=True,
+    )
 
-# Инлайн-меню выбора категории карт
-cards_category_kb = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="🃏 Обычные", callback_data="cards_common")],
-    [InlineKeyboardButton(text="🎲 Генерки", callback_data="cards_gen")],
-    [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")]
-])
-
-# Кнопка "Ещё раз"
-def get_more_kb(category: str):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Ещё раз", callback_data=f"more_{category}")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")]
-    ])
-
-# Админ-меню (добавление / удаление)
 admin_menu = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="➕ Код", callback_data="code")],
     [InlineKeyboardButton(text="➕ Почта", callback_data="email")],
     [InlineKeyboardButton(text="➕ Домен", callback_data="domain")],
     [InlineKeyboardButton(text="➕ Доступ", callback_data="access")],
     [InlineKeyboardButton(text="➕ Мануал", callback_data="manual")],
-    [InlineKeyboardButton(text="➕ Карта (обыч)", callback_data="card_common")],
-    [InlineKeyboardButton(text="➕ Карта (генер)", callback_data="card_gen")],
+    [InlineKeyboardButton(text="➕ Карта обычн.", callback_data="card_regular")],
+    [InlineKeyboardButton(text="➕ Карта генерка", callback_data="card_generated")],
     [InlineKeyboardButton(text="🗑 Доступы", callback_data="show_access")],
     [InlineKeyboardButton(text="🗑 Мануалы", callback_data="show_manual")],
-    [InlineKeyboardButton(text="🗑 Карты (обыч)", callback_data="show_cards_common")],
-    [InlineKeyboardButton(text="🗑 Карты (генер)", callback_data="show_cards_gen")],
-    [InlineKeyboardButton(text="📤 Логи", callback_data="logs")]
+    [InlineKeyboardButton(text="🗑 Карты обычн.", callback_data="show_card_regular")],
+    [InlineKeyboardButton(text="🗑 Карты генерки", callback_data="show_card_generated")],
+    [InlineKeyboardButton(text="📤 Логи", callback_data="logs")],
 ])
 
 rate_kb = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="✅ ОК", callback_data="ok"),
-     InlineKeyboardButton(text="❌ БАН", callback_data="ban")]
+    [
+        InlineKeyboardButton(text="✅ ОК", callback_data="ok"),
+        InlineKeyboardButton(text="❌ БАН", callback_data="ban"),
+    ]
 ])
 
-# Функция построения клавиатуры удаления для произвольной таблицы
-def build_delete_kb(rows, prefix: str):
-    """rows: список кортежей (id, value)"""
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=row[1][:50], callback_data=f"{prefix}_{row[0]}")]
-        for row in rows[:50]  # ограничим, чтобы не сломать сообщение
+cards_menu = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="🃏 Обычные", callback_data="pick_regular")],
+    [InlineKeyboardButton(text="✨ Генерки", callback_data="pick_generated")],
+])
+
+def again_kb(category: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔁 Ещё раз", callback_data=f"again_{category}")]
     ])
-    return kb
 
-# ------------------- СОСТОЯНИЯ (для ввода данных админом) -------------------
-admin_input_state = {}   # {uid: (mode, table_name?)}
+def build_delete_kb(rows, prefix):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=str(r["value"])[:60], callback_data=f"{prefix}_{r['id']}")]
+            for r in rows
+        ]
+    )
 
-# ------------------- ОБРАБОТЧИКИ СООБЩЕНИЙ -------------------
+# ===== LOG / STATS =====
+async def log(uid, action, item):
+    async with pool.acquire() as c:
+        await c.execute(
+            "INSERT INTO logs(uid, action, item) VALUES($1, $2, $3)",
+            uid, action, item,
+        )
+
+async def get_user(uid):
+    async with pool.acquire() as c:
+        return await c.fetchrow("SELECT * FROM users WHERE id=$1", uid)
+
+async def count_user(uid, action) -> int:
+    async with pool.acquire() as c:
+        v = await c.fetchval(
+            "SELECT COUNT(*) FROM logs WHERE uid=$1 AND action=$2", uid, action
+        )
+        return int(v or 0)
+
+async def count_all(action) -> int:
+    async with pool.acquire() as c:
+        v = await c.fetchval("SELECT COUNT(*) FROM logs WHERE action=$1", action)
+        return int(v or 0)
+
+async def export_logs() -> bytes:
+    async with pool.acquire() as c:
+        rows = await c.fetch("SELECT ts, uid, action, item FROM logs ORDER BY id")
+    lines = [f"{r['ts']} | {r['uid']} | {r['action']} | {r['item']}" for r in rows]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+# ===== CARDS =====
+async def pick_card(uid: int, category: str):
+    if category not in CARD_CATEGORIES:
+        return None
+    table = CARD_CATEGORIES[category][1]
+    async with pool.acquire() as c:
+        await c.execute("DELETE FROM card_cooldown WHERE until_ts < NOW()")
+        rows = await c.fetch(f"""
+            SELECT id, value FROM {table}
+            WHERE id NOT IN (
+                SELECT card_id FROM card_cooldown
+                WHERE uid=$1 AND category=$2 AND until_ts > NOW()
+            )
+        """, uid, category)
+        if not rows:
+            return None
+        row = random.choice(rows)
+        minutes = random.randint(CARD_COOLDOWN_MIN, CARD_COOLDOWN_MAX)
+        until = datetime.utcnow() + timedelta(minutes=minutes)
+        await c.execute("""
+            INSERT INTO card_cooldown(uid, category, card_id, until_ts)
+            VALUES($1, $2, $3, $4)
+            ON CONFLICT (uid, category, card_id)
+            DO UPDATE SET until_ts = EXCLUDED.until_ts
+        """, uid, category, row["id"], until)
+        return row
+
+# ===== MAIN =====
 @router.message()
-async def handle_all_messages(msg: Message):
+async def all_handler(msg: Message):
     uid = msg.from_user.id
-    text = msg.text
+    text = msg.text or ""
+    user = await get_user(uid)
 
-    # ----- Админ вводит данные -----
-    if uid == ADMIN_ID and uid in admin_input_state:
-        mode = admin_input_state[uid]   # "code", "email", "domain", "access", "manual", "card_common", "card_gen"
-        # Определяем таблицу
-        table_map = {
+    # ===== ADMIN INPUT =====
+    if uid == ADMIN_ID and uid in admin_mode:
+        mode = admin_mode[uid]
+        table = {
             "code": "codes",
             "email": "emails",
             "domain": "domains",
             "access": "accesses",
             "manual": "manuals",
-            "card_common": "cards_common",
-            "card_gen": "cards_gen"
-        }
-        table = table_map.get(mode)
+            "card_regular": "cards_regular",
+            "card_generated": "cards_generated",
+        }.get(mode)
         if table:
-            async with db_pool.acquire() as conn:
-                await conn.execute(f"INSERT INTO {table} (value) VALUES ($1)", text)
-            await msg.answer("✅ Добавлено")
-        else:
-            await msg.answer("❌ Неизвестный режим")
-        del admin_input_state[uid]
-        return
+            col = "code" if mode == "code" else "value"
+            async with pool.acquire() as c:
+                await c.execute(f"INSERT INTO {table}({col}) VALUES($1)", text)
+            del admin_mode[uid]
+            return await msg.answer("✅ добавлено")
 
-    # ----- Проверка пользователя -----
-    async with db_pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE id=$1", uid)
-
-    # ----- Старт или авторизация по коду -----
+    # ===== START =====
     if text == "/start":
         if not user and uid != ADMIN_ID:
-            return await msg.answer("🔐 Введите код доступа")
+            return await msg.answer("🔐 Введи код доступа")
         return await msg.answer("🚀 CRM готова", reply_markup=get_menu(uid))
 
+    # ===== AUTH =====
     if not user and uid != ADMIN_ID:
-        async with db_pool.acquire() as conn:
-            exists = await conn.fetchrow("SELECT * FROM codes WHERE code=$1", text)
-            if not exists:
+        async with pool.acquire() as c:
+            row = await c.fetchrow("SELECT id FROM codes WHERE code=$1", text)
+            if not row:
                 return await msg.answer("❌ Неверный код")
-            await conn.execute("DELETE FROM codes WHERE code=$1", text)
-            await conn.execute("INSERT INTO users (id, role) VALUES ($1, $2)", uid, "user")
+            await c.execute("DELETE FROM codes WHERE id=$1", row["id"])
+            await c.execute(
+                "INSERT INTO users(id, role) VALUES($1, $2) ON CONFLICT (id) DO NOTHING",
+                uid, "user",
+            )
         return await msg.answer("✅ Доступ открыт", reply_markup=get_menu(uid))
 
-    # ----- Обработка обычных кнопок -----
+    # ===== PROFILE =====
     if text == "👤 Профиль":
-        role = "admin" if uid == ADMIN_ID else "user"
-        email_cnt = await count_user(uid, "take_email")
-        domain_cnt = await count_user(uid, "take_domain")
-        ok_cnt = await count_user(uid, "ok")
-        ban_cnt = await count_user(uid, "ban")
-        await msg.answer(
+        role = "admin" if uid == ADMIN_ID else (user["role"] if user else "user")
+        return await msg.answer(
             f"👤 ID: {uid}\n"
             f"🎭 Роль: {role}\n"
-            f"📧 почт: {email_cnt}\n"
-            f"🌐 доменов: {domain_cnt}\n"
-            f"✅ OK: {ok_cnt}\n"
-            f"❌ BAN: {ban_cnt}"
+            f"📧 почт: {await count_user(uid, 'take_email')}\n"
+            f"🌐 доменов: {await count_user(uid, 'take_domain')}\n"
+            f"🎴 карт: {await count_user(uid, 'take_card')}\n"
+            f"✅ OK: {await count_user(uid, 'ok')}\n"
+            f"❌ BAN: {await count_user(uid, 'ban')}"
         )
-        return
 
+    # ===== EMAIL =====
     if text == "📧 Почта":
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT id, value FROM emails LIMIT 1")
+        async with pool.acquire() as c:
+            row = await c.fetchrow("SELECT id, value FROM emails ORDER BY id LIMIT 1")
             if not row:
-                return await msg.answer("❌ Нет почт")
-            await conn.execute("DELETE FROM emails WHERE id=$1", row['id'])
-        await log(uid, "take_email", row['value'])
-        # сохраним последний выданный item для кнопок ОК/БАН
-        if not hasattr(handle_all_messages, "last_item"):
-            handle_all_messages.last_item = {}
-        handle_all_messages.last_item[uid] = ("email", row['value'])
-        await msg.answer(row['value'], reply_markup=rate_kb)
-        return
+                return await msg.answer("❌ нет почт")
+            await c.execute("DELETE FROM emails WHERE id=$1", row["id"])
+        last_item[uid] = ("email", row["value"])
+        await log(uid, "take_email", row["value"])
+        return await msg.answer(row["value"], reply_markup=rate_kb)
 
+    # ===== DOMAIN =====
     if text == "🌐 Домен":
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT id, value FROM domains LIMIT 1")
+        async with pool.acquire() as c:
+            row = await c.fetchrow("SELECT id, value FROM domains ORDER BY id LIMIT 1")
             if not row:
-                return await msg.answer("❌ Нет доменов")
-            await conn.execute("DELETE FROM domains WHERE id=$1", row['id'])
-        await log(uid, "take_domain", row['value'])
-        if not hasattr(handle_all_messages, "last_item"):
-            handle_all_messages.last_item = {}
-        handle_all_messages.last_item[uid] = ("domain", row['value'])
-        await msg.answer(row['value'], reply_markup=rate_kb)
-        return
+                return await msg.answer("❌ нет доменов")
+            await c.execute("DELETE FROM domains WHERE id=$1", row["id"])
+        last_item[uid] = ("domain", row["value"])
+        await log(uid, "take_domain", row["value"])
+        return await msg.answer(row["value"], reply_markup=rate_kb)
 
+    # ===== ACCESS =====
     if text == "🔑 Доступы":
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch("SELECT value FROM accesses")
-        if rows:
-            await msg.answer("\n".join(r['value'] for r in rows))
-        else:
-            await msg.answer("нет доступов")
-        return
+        async with pool.acquire() as c:
+            rows = await c.fetch("SELECT value FROM accesses ORDER BY id")
+        return await msg.answer("\n".join(r["value"] for r in rows) or "нет")
 
+    # ===== MANUALS =====
     if text == "📚 Мануалы":
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch("SELECT value FROM manuals")
-        if rows:
-            await msg.answer("\n".join(r['value'] for r in rows))
-        else:
-            await msg.answer("нет мануалов")
-        return
+        async with pool.acquire() as c:
+            rows = await c.fetch("SELECT value FROM manuals ORDER BY id")
+        return await msg.answer("\n".join(r["value"] for r in rows) or "нет")
 
-    if text == "💳 Карты":
-        await msg.answer("Выберите категорию карт:", reply_markup=cards_category_kb)
-        return
+    # ===== CARDS =====
+    if text == "🎴 Карты":
+        return await msg.answer("Выбери категорию карт:", reply_markup=cards_menu)
 
+    # ===== DASHBOARD =====
     if text == "📊 Дашборд" and uid == ADMIN_ID:
-        email_all = await count_all("take_email")
-        domain_all = await count_all("take_domain")
-        ok_all = await count_all("ok")
-        ban_all = await count_all("ban")
-        await msg.answer(
+        return await msg.answer(
             f"📊 Статистика:\n"
-            f"📧 почты: {email_all}\n"
-            f"🌐 домены: {domain_all}\n"
-            f"✅ OK: {ok_all}\n"
-            f"❌ BAN: {ban_all}"
+            f"📧 почты: {await count_all('take_email')}\n"
+            f"🌐 домены: {await count_all('take_domain')}\n"
+            f"🎴 карты: {await count_all('take_card')}\n"
+            f"✅ OK: {await count_all('ok')}\n"
+            f"❌ BAN: {await count_all('ban')}"
         )
-        return
 
+    # ===== ADMIN =====
     if text == "🛠 Админ" and uid == ADMIN_ID:
-        await msg.answer("⚙️ Панель управления", reply_markup=admin_menu)
-        return
+        return await msg.answer("⚙️ Панель", reply_markup=admin_menu)
 
-    # Неизвестная команда
-    await msg.answer("Используйте кнопки меню")
-
-# ------------------- ОБРАБОТЧИКИ CALLBACK -------------------
+# ===== CALLBACK =====
 @router.callback_query()
-async def handle_callbacks(call: types.CallbackQuery):
-    uid = call.from_user.id
-    data = call.data
+async def cb(c: CallbackQuery):
+    await c.answer()
+    uid = c.from_user.id
+    data = c.data or ""
 
-    # ----- OK / BAN -----
-    if data in ["ok", "ban"]:
-        last_item_dict = getattr(handle_all_messages, "last_item", {})
-        if uid in last_item_dict:
-            item_type, value = last_item_dict[uid]
+    # ===== OK / BAN =====
+    if data in ("ok", "ban"):
+        if uid in last_item:
+            item_type, value = last_item[uid]
             await log(uid, data, value)
-            del last_item_dict[uid]
-            await call.message.edit_text(f"{data.upper()} сохранено")
-        else:
-            await call.answer("Нет активного элемента для оценки", show_alert=True)
-        await call.answer()
+            del last_item[uid]
+            return await c.message.answer(f"{data.upper()} сохранено")
         return
 
-    # ----- Карты: выбор категории -----
-    if data == "cards_common" or data == "cards_gen":
-        category = "common" if data == "cards_common" else "gen"
-        card = await get_random_card(category)
-        if not card:
-            await call.message.edit_text("❌ В этой категории пока нет карт", reply_markup=cards_category_kb)
-        else:
-            await call.message.edit_text(
-                f"🎴 Ваша карта:\n\n{card}",
-                reply_markup=get_more_kb(category)
-            )
-        await call.answer()
-        return
+    # ===== CARDS PICK / AGAIN =====
+    if data.startswith("pick_") or data.startswith("again_"):
+        category = data.split("_", 1)[1]
+        if category not in CARD_CATEGORIES:
+            return
+        if uid != ADMIN_ID and not await get_user(uid):
+            return await c.message.answer("🔐 Введи код доступа")
+        row = await pick_card(uid, category)
+        cat_name = CARD_CATEGORIES[category][0]
+        if not row:
+            return await c.message.answer(f"❌ нет доступных карт ({cat_name})")
+        await log(uid, "take_card", f"{category}:{row['value']}")
+        return await c.message.answer(
+            f"🎴 {cat_name}\n\n{row['value']}",
+            reply_markup=again_kb(category),
+        )
 
-    # ----- Ещё раз -----
-    if data.startswith("more_"):
-        category = data.split("_")[1]  # "common" или "gen"
-        card = await get_random_card(category)
-        if not card:
-            await call.message.edit_text("❌ Карт больше нет", reply_markup=cards_category_kb)
-        else:
-            await call.message.edit_text(
-                f"🎴 Ваша карта:\n\n{card}",
-                reply_markup=get_more_kb(category)
-            )
-        await call.answer()
-        return
-
-    if data == "back_to_menu":
-        await call.message.delete()
-        await call.message.answer("Главное меню", reply_markup=get_menu(uid))
-        await call.answer()
-        return
-
-    # ----- Далее только для админа -----
     if uid != ADMIN_ID:
-        await call.answer("Нет прав", show_alert=True)
         return
 
-    # ----- Логи -----
+    # ===== LOGS =====
     if data == "logs":
-        logs_text = await get_logs_text()
-        with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False, encoding="utf-8") as tmp:
-            tmp.write(logs_text)
-            tmp_path = tmp.name
-        try:
-            await call.message.answer_document(FSInputFile(tmp_path, filename="logs.txt"))
-        except Exception as e:
-            await call.message.answer(f"Ошибка отправки логов: {e}")
-        finally:
-            os.unlink(tmp_path)
-        await call.answer()
-        return
+        data_bytes = await export_logs()
+        if not data_bytes.strip():
+            return await c.message.answer("нет логов")
+        return await c.message.answer_document(
+            BufferedInputFile(data_bytes, filename="logs.txt")
+        )
 
-    # ----- Просмотр для удаления (доступы, мануалы, карты) -----
+    # ===== SHOW DELETE =====
     if data == "show_access":
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch("SELECT id, value FROM accesses")
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT id, value FROM accesses ORDER BY id")
         if not rows:
-            await call.message.answer("Нет доступов")
-        else:
-            await call.message.answer("Выберите доступ для удаления:", reply_markup=build_delete_kb(rows, "del_access"))
-        await call.answer()
-        return
+            return await c.message.answer("нет доступов")
+        return await c.message.answer("выбери:", reply_markup=build_delete_kb(rows, "del_access"))
 
     if data == "show_manual":
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch("SELECT id, value FROM manuals")
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT id, value FROM manuals ORDER BY id")
         if not rows:
-            await call.message.answer("Нет мануалов")
-        else:
-            await call.message.answer("Выберите мануал для удаления:", reply_markup=build_delete_kb(rows, "del_manual"))
-        await call.answer()
-        return
+            return await c.message.answer("нет мануалов")
+        return await c.message.answer("выбери:", reply_markup=build_delete_kb(rows, "del_manual"))
 
-    if data == "show_cards_common":
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch("SELECT id, value FROM cards_common")
+    if data == "show_card_regular":
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT id, value FROM cards_regular ORDER BY id")
         if not rows:
-            await call.message.answer("Нет обычных карт")
-        else:
-            await call.message.answer("Выберите карту для удаления:", reply_markup=build_delete_kb(rows, "del_card_common"))
-        await call.answer()
-        return
+            return await c.message.answer("нет карт (обычные)")
+        return await c.message.answer("выбери:", reply_markup=build_delete_kb(rows, "del_cardr"))
 
-    if data == "show_cards_gen":
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch("SELECT id, value FROM cards_gen")
+    if data == "show_card_generated":
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT id, value FROM cards_generated ORDER BY id")
         if not rows:
-            await call.message.answer("Нет генераторных карт")
-        else:
-            await call.message.answer("Выберите карту для удаления:", reply_markup=build_delete_kb(rows, "del_card_gen"))
-        await call.answer()
-        return
+            return await c.message.answer("нет карт (генерки)")
+        return await c.message.answer("выбери:", reply_markup=build_delete_kb(rows, "del_cardg"))
 
-    # ----- Удаление записей -----
+    # ===== DELETE =====
     if data.startswith("del_access_"):
-        record_id = int(data.split("_")[2])
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM accesses WHERE id=$1", record_id)
-        await call.message.edit_text("✅ Доступ удалён")
-        await call.answer()
-        return
+        rid = int(data.split("_")[2])
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM accesses WHERE id=$1", rid)
+        return await c.message.answer("✅ удалено")
 
     if data.startswith("del_manual_"):
-        record_id = int(data.split("_")[2])
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM manuals WHERE id=$1", record_id)
-        await call.message.edit_text("✅ Мануал удалён")
-        await call.answer()
-        return
+        rid = int(data.split("_")[2])
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM manuals WHERE id=$1", rid)
+        return await c.message.answer("✅ удалено")
 
-    if data.startswith("del_card_common_"):
-        record_id = int(data.split("_")[3])
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM cards_common WHERE id=$1", record_id)
-        await call.message.edit_text("✅ Карта удалена")
-        await call.answer()
-        return
+    if data.startswith("del_cardr_"):
+        rid = int(data.split("_")[2])
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM cards_regular WHERE id=$1", rid)
+            await conn.execute(
+                "DELETE FROM card_cooldown WHERE category='regular' AND card_id=$1", rid
+            )
+        return await c.message.answer("✅ удалено")
 
-    if data.startswith("del_card_gen_"):
-        record_id = int(data.split("_")[3])
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM cards_gen WHERE id=$1", record_id)
-        await call.message.edit_text("✅ Карта удалена")
-        await call.answer()
-        return
+    if data.startswith("del_cardg_"):
+        rid = int(data.split("_")[2])
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM cards_generated WHERE id=$1", rid)
+            await conn.execute(
+                "DELETE FROM card_cooldown WHERE category='generated' AND card_id=$1", rid
+            )
+        return await c.message.answer("✅ удалено")
 
-    # ----- Админ ввод (добавление) -----
-    if data in ["code", "email", "domain", "access", "manual", "card_common", "card_gen"]:
-        admin_input_state[uid] = data
-        await call.message.answer(f"Введите текст для {data}:")
-        await call.answer()
-        return
+    # ===== ADD =====
+    if data in ("code", "email", "domain", "access", "manual",
+                "card_regular", "card_generated"):
+        admin_mode[uid] = data
+        return await c.message.answer(f"введи {data}")
 
-    await call.answer("Неизвестный callback")
-
-# ------------------- НАСТРОЙКА ВЕБХУКА И ЗАПУСК -------------------
-async def on_startup():
+# ===== WEB / WEBHOOK =====
+async def on_startup(app: web.Application):
     await init_db()
-    await bot.set_webhook(WEBHOOK_URL)
+    if not WEBHOOK_BASE:
+        print("⚠️ WEBHOOK_BASE не задан — webhook не выставлен")
+        return
+    url = WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH
+    await bot.set_webhook(
+        url=url,
+        secret_token=WEBHOOK_SECRET or None,
+        drop_pending_updates=True,
+        allowed_updates=dp.resolve_used_update_types(),
+    )
+    print(f"✅ Webhook установлен: {url}")
 
-async def on_shutdown():
-    await bot.delete_webhook()
-    if db_pool:
-        await db_pool.close()
+async def on_shutdown(app: web.Application):
+    try:
+        await bot.delete_webhook()
+    finally:
+        await bot.session.close()
+        if pool:
+            await pool.close()
+
+async def health(request: web.Request):
+    return web.Response(text="ok")
 
 def main():
+    dp.include_router(router)
+
     app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET or None,
+    ).register(app, path=WEBHOOK_PATH)
+
+    setup_application(app, dp, bot=bot)
+
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
 
-    webhook_requests_handler = SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot,
-    )
-    webhook_requests_handler.register(app, path=WEBHOOK_PATH)
-    setup_application(app, dp, bot=bot)
-
-    port = int(os.environ.get("PORT", 8080))
-    web.run_app(app, host="0.0.0.0", port=port)
+    print(f"FINAL CRM READY on :{PORT}")
+    web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
     main()
