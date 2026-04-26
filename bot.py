@@ -15,9 +15,9 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiohttp import web
 
 # ===== CONFIG =====
-TOKEN = os.getenv("BOT_TOKEN", "ТВОЙ_ТОКЕН")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "7062911219"))
-DATABASE_URL = os.getenv("DATABASE_URL", "")  # Render даёт автоматически
+print("BOT_TOKEN:", os.getenv("BOT_TOKEN"))
+print("DATABASE_URL:", os.getenv("DATABASE_URL"))
+print("WEBHOOK_URL:", os.getenv("WEBHOOK_URL"))
 
 PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "")  # https://my-bot.onrender.com
